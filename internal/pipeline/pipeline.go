@@ -271,6 +271,14 @@ func (p *Pipeline) restore(src Source, resumeOffset int64) (int64, error) {
 	}
 	p.gen = st.Generation
 	p.tracker.SetMaxSeen(st.Watermark)
+	buffered := make([]event.MarketEvent, len(st.Buffered))
+	for i, b := range st.Buffered {
+		buffered[i] = event.MarketEvent{
+			ID: b.ID, Symbol: b.Symbol, Price: b.Price,
+			Volume: b.Volume, Seq: b.Seq, EventTime: b.EventTime,
+		}
+	}
+	p.tracker.RestoreBuffered(buffered)
 	snap := make(map[string]dedup.Entry, len(st.DedupState))
 	for k, v := range st.DedupState {
 		snap[k] = dedup.Entry{Fingerprint: v.Fingerprint, Seq: v.Seq}
@@ -350,6 +358,12 @@ func (p *Pipeline) commit(offset int64) error {
 	}
 	for k, v := range snap {
 		st.DedupState[k] = checkpoint.DedupEntry{Fingerprint: v.Fingerprint, Seq: v.Seq}
+	}
+	for _, ev := range p.tracker.Snapshot() {
+		st.Buffered = append(st.Buffered, checkpoint.BufferedEvent{
+			ID: ev.ID, Symbol: ev.Symbol, Price: ev.Price,
+			Volume: ev.Volume, Seq: ev.Seq, EventTime: ev.EventTime,
+		})
 	}
 	if err := p.cpStore.Save(st); err != nil {
 		return fmt.Errorf("commit checkpoint: %w", err)

@@ -26,8 +26,19 @@ type State struct {
 	Offset     int64                 // 已提交的源位点（下一条待读）
 	Watermark  time.Time             // 已提交的水位线基准（maxSeen）
 	DedupState map[string]DedupEntry // 去重状态快照
+	Buffered   []BufferedEvent       // 已处理但未输出（滞留在重排缓冲）的事件
 	Committed  time.Time             // 断点提交时间
 	Generation uint64                // 单调递增的代际号
+}
+
+// BufferedEvent 是重排缓冲中事件的可序列化形式。
+type BufferedEvent struct {
+	ID        string    `json:"id"`
+	Symbol    string    `json:"symbol"`
+	Price     float64   `json:"price"`
+	Volume    float64   `json:"volume"`
+	Seq       uint64    `json:"seq"`
+	EventTime time.Time `json:"event_time"`
 }
 
 // DedupEntry 是去重状态的可序列化条目。
@@ -41,6 +52,7 @@ type stateFile struct {
 	Offset     int64                 `json:"offset"`
 	Watermark  time.Time             `json:"watermark"`
 	DedupState map[string]DedupEntry `json:"dedup_state"`
+	Buffered   []BufferedEvent       `json:"buffered"`
 	Committed  time.Time             `json:"committed"`
 	Generation uint64                `json:"generation"`
 }
@@ -71,6 +83,7 @@ func (s *Store) Save(st State) error {
 		Offset:     st.Offset,
 		Watermark:  st.Watermark,
 		DedupState: st.DedupState,
+		Buffered:   st.Buffered,
 		Committed:  st.Committed,
 		Generation: st.Generation,
 	}
@@ -111,6 +124,7 @@ func (s *Store) Load() (*State, error) {
 		Offset:     f.Offset,
 		Watermark:  f.Watermark,
 		DedupState: f.DedupState,
+		Buffered:   f.Buffered,
 		Committed:  f.Committed,
 		Generation: f.Generation,
 	}, nil

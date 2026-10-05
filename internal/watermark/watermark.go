@@ -97,6 +97,20 @@ func (t *Tracker) Buffered() int {
 	return t.buf.Len()
 }
 
+// Snapshot 导出缓冲中的事件（用于断点持久化），不保证顺序。
+func (t *Tracker) Snapshot() []event.MarketEvent {
+	out := make([]event.MarketEvent, len(t.buf))
+	copy(out, t.buf)
+	return out
+}
+
+// RestoreBuffered 从断点恢复重排缓冲内容。
+func (t *Tracker) RestoreBuffered(evs []event.MarketEvent) {
+	t.buf = append(t.buf[:0], evs...)
+	heap.Init(&t.buf)
+	t.reindex()
+}
+
 // SetMaxSeen 恢复断点时直接设置已见最大事件时间。
 func (t *Tracker) SetMaxSeen(ts time.Time) {
 	t.maxSeen = ts
