@@ -1,0 +1,7 @@
+{"schema_v":1,"seq_id":"s1","symbol":"BTCUSDT","price":100,"qty":1,"event_time":"2026-10-06T10:00:00Z"}
+{"schema_v":1,"seq_id":"s3","symbol":"BTCUSDT","price":102,"qty":1,"event_time":"2026-10-06T10:00:02Z"}
+{"schema_v":1,"seq_id":"s2","symbol":"BTCUSDT","price":101,"qty":1,"event_time":"2026-10-06T10:00:01Z"}
+{"type":"watermark","watermark":"2026-10-06T10:00:03Z"}
+{"schema_v":1,"seq_id":"s1","symbol":"BTCUSDT","price":100,"qty":1,"event_time":"2026-10-06T10:00:00Z"}
+{"schema_v":1,"seq_id":"s0","symbol":"BTCUSDT","price":99,"qty":1,"event_time":"2026-10-06T09:59:59Z"}
+{"schema_v":2,"seq_id":"s4","symbol":"ETHUSDT","price":2000,"qty":2,"event_time":"2026-10-06T10:00:04Z","extra":{"bid_size":7}}
