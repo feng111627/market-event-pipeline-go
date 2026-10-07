@@ -33,12 +33,102 @@ type State struct {
 
 // BufferedEvent 是重排缓冲中事件的可序列化形式。
 type BufferedEvent struct {
-	ID        string    `json:"id"`
-	Symbol    string    `json:"symbol"`
-	Price     float64   `json:"price"`
-	Volume    float64   `json:"volume"`
-	Seq       uint64    `json:"seq"`
-	EventTime time.Time `json:"event_time"`
+	ID            string                 `json:"id"`
+	Symbol        string                 `json:"symbol"`
+	Price         float64                `json:"price"`
+	Volume        float64                `json:"volume"`
+	Seq           uint64                 `json:"seq"`
+	EventTime     time.Time              `json:"event_time"`
+	SchemaVersion int                    `json:"schema_version"`
+	Attrs         map[string]interface{} `json:"attrs,omitempty"` // 已声明扩展字段，随断点完整恢复
+}
+
+// timeMarker 包裹 attrs 中的 time.Time，避免 JSON 往返后退化为字符串、
+// 改变内容指纹（保证缺省与转换语义可复现）。
+const timeMarker = "$time"
+
+func encodeAttrs(in map[string]interface{}) map[string]interface{} {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]interface{}, len(in))
+	for k, v := range in {
+		out[k] = encodeValue(v)
+	}
+	return out
+}
+
+func encodeValue(v interface{}) interface{} {
+	switch t := v.(type) {
+	case time.Time:
+		return map[string]interface{}{timeMarker: t.Format(time.RFC3339Nano)}
+	case map[string]interface{}:
+		return encodeAttrs(t)
+	default:
+		return v
+	}
+}
+
+func decodeAttrs(in map[string]interface{}) (map[string]interface{}, error) {
+	if in == nil {
+		return nil, nil
+	}
+	out := make(map[string]interface{}, len(in))
+	for k, v := range in {
+		dv, err := decodeValue(v)
+		if err != nil {
+			return nil, fmt.Errorf("attr %q: %w", k, err)
+		}
+		out[k] = dv
+	}
+	return out, nil
+}
+
+func decodeValue(v interface{}) (interface{}, error) {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		if raw, ok := t[timeMarker].(string); ok && len(t) == 1 {
+			ts, err := time.Parse(time.RFC3339Nano, raw)
+			if err != nil {
+				return nil, fmt.Errorf("parse %s: %w", timeMarker, err)
+			}
+			return ts, nil
+		}
+		return decodeAttrs(t)
+	default:
+		return v, nil
+	}
+}
+
+// MarshalJSON 自定义序列化：attrs 中的时间用显式类型标记包裹。
+func (b BufferedEvent) MarshalJSON() ([]byte, error) {
+	type alias BufferedEvent // 避免递归
+	return json.Marshal(alias(BufferedEvent{
+		ID:            b.ID,
+		Symbol:        b.Symbol,
+		Price:         b.Price,
+		Volume:        b.Volume,
+		Seq:           b.Seq,
+		EventTime:     b.EventTime,
+		SchemaVersion: b.SchemaVersion,
+		Attrs:         encodeAttrs(b.Attrs),
+	}))
+}
+
+// UnmarshalJSON 自定义反序列化：还原 attrs 中的时间类型。
+func (b *BufferedEvent) UnmarshalJSON(data []byte) error {
+	type alias BufferedEvent
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	attrs, err := decodeAttrs(a.Attrs)
+	if err != nil {
+		return err
+	}
+	*b = BufferedEvent(a)
+	b.Attrs = attrs
+	return nil
 }
 
 // DedupEntry 是去重状态的可序列化条目。

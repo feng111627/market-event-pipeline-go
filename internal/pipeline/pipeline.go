@@ -60,6 +60,33 @@ func MarketEventSchemaV2() schema.Schema {
 	return s
 }
 
+// MarketEventSchemaV3 在 V2 基础上再新增两个可选字段：
+//   - venue_mic（string，缺省 "XXXX"，模拟交易所 MIC 占位码）；
+//   - is_maker（bool，缺省 false）。
+//
+// 用于验证多次兼容演进后，所有已声明字段（含为旧版本数据补齐的缺省值）
+// 都能完整到达下游。
+func MarketEventSchemaV3() schema.Schema {
+	s := MarketEventSchemaV2()
+	s.Version = 3
+	s.Fields = append(s.Fields,
+		schema.Field{Name: "venue_mic", Type: schema.TypeString, Required: false, Default: "XXXX"},
+		schema.Field{Name: "is_maker", Type: schema.TypeBool, Required: false, Default: false},
+	)
+	return s
+}
+
+// DefaultRegistry 注册内置的全部结构版本（V1/V2/V3），均通过兼容性校验。
+func DefaultRegistry() *schema.Registry {
+	reg := schema.NewRegistry()
+	for _, s := range []schema.Schema{MarketEventSchemaV1(), MarketEventSchemaV2(), MarketEventSchemaV3()} {
+		if err := reg.Register(s); err != nil {
+			panic(err) // 内置版本不兼容属于程序缺陷
+		}
+	}
+	return reg
+}
+
 // Config 是流水线配置。
 type Config struct {
 	MaxOutOfOrderness time.Duration // 允许的最大乱序时长
@@ -70,6 +97,7 @@ type Config struct {
 	CheckpointPath    string        // 断点文件路径
 	CheckpointTTL     time.Duration // 断点有效期（<=0 不过期）
 	ResultRingSize    int           // 处理回执环形缓冲容量（观测用）
+	MaxBuffered       int           // 乱序缓冲硬上界（<=0 不限制）；超限强制按序提前输出，内存不随输入规模增长
 }
 
 // DefaultConfig 返回本地可用的默认配置。
@@ -83,6 +111,7 @@ func DefaultConfig() Config {
 		CheckpointPath:    "data/checkpoint.json",
 		CheckpointTTL:     24 * time.Hour,
 		ResultRingSize:    1024,
+		MaxBuffered:       100000,
 	}
 }
 
@@ -112,6 +141,12 @@ func (c Config) withDefaults() Config {
 	if c.ResultRingSize != 0 {
 		d.ResultRingSize = c.ResultRingSize
 	}
+	// 0 与负值区分：0 表示未设置（用默认上界），负值显式表示不限制。
+	if c.MaxBuffered > 0 {
+		d.MaxBuffered = c.MaxBuffered
+	} else if c.MaxBuffered < 0 {
+		d.MaxBuffered = 0
+	}
 	return d
 }
 
@@ -120,6 +155,17 @@ type SourceRecord struct {
 	Offset        int64
 	SchemaVersion int
 	Payload       map[string]interface{}
+	// NextOffset 是本条结束后"下一条的起始位点"；为 0 时默认 Offset+1。
+	// 按行/字节流式输入用它表达跨行的真实字节位点，保证断点恢复精确不跳字节。
+	NextOffset int64
+}
+
+// commitOffset 返回处理完本条后应提交的位点。
+func (r SourceRecord) commitOffset() int64 {
+	if r.NextOffset > r.Offset {
+		return r.NextOffset
+	}
+	return r.Offset + 1
 }
 
 // Source 抽象上游数据源。
@@ -139,6 +185,7 @@ type Sink interface {
 
 // Stats 汇总运行期统计，供测试与观测断言。
 type Stats struct {
+	Processed   int // 本次运行实际读取并处置的记录总数（被拒绝/丢弃的也算）
 	Accepted    int
 	Duplicates  int
 	Stales      int
@@ -160,12 +207,13 @@ type Pipeline struct {
 	results    []event.Result // 环形缓冲，容量 ResultRingSize
 	gen        uint64
 	lastOffset int64 // 最近处理的一条源位点
+	lastNext   int64 // 最近处理一条之后的下一位点
 }
 
 // New 创建流水线；reg 为结构注册表（至少包含 V1）。
 func New(cfg Config, reg *schema.Registry) *Pipeline {
 	c := cfg.withDefaults()
-	return &Pipeline{
+	p := &Pipeline{
 		cfg:      c,
 		registry: reg,
 		dedup:    dedup.NewStore(c.DedupCapacity),
@@ -173,11 +221,43 @@ func New(cfg Config, reg *schema.Registry) *Pipeline {
 		cpStore:  checkpoint.NewStore(c.CheckpointPath, c.CheckpointTTL),
 		results:  make([]event.Result, 0, c.ResultRingSize),
 	}
+	p.tracker.SetMaxBuffered(c.MaxBuffered)
+	return p
 }
 
 // Stats 返回当前统计快照。
 func (p *Pipeline) Stats() Stats {
 	return p.stats
+}
+
+// Summary 是一次运行的可读汇总：总处理数与每种处置结论的数量。
+type Summary struct {
+	Processed        int
+	Accepted         int
+	DuplicateDropped int
+	StaleDropped     int
+	Merged           int
+	LateDropped      int
+	Rejected         int
+	Emitted          int
+	Checkpoints      int
+}
+
+// Summary 返回当前汇总快照（Processed = 实际处置的记录数；
+// 五类处置互斥且合计等于 Processed）。
+func (p *Pipeline) Summary() Summary {
+	s := p.stats
+	return Summary{
+		Processed:        s.Processed,
+		Accepted:         s.Accepted,
+		DuplicateDropped: s.Duplicates,
+		StaleDropped:     s.Stales,
+		Merged:           s.Merged,
+		LateDropped:      s.LateDropped,
+		Rejected:         s.Rejected,
+		Emitted:          s.Emitted,
+		Checkpoints:      s.Checkpoints,
+	}
 }
 
 // Results 返回最近的处理回执（环形缓冲，最多 ResultRingSize 条）。
@@ -232,7 +312,7 @@ func (p *Pipeline) run(ctx context.Context, src Source, sink Sink, resumeOffset 
 		}
 		processed++
 		if processed%p.cfg.CheckpointEvery == 0 {
-			if err := p.commit(rec.Offset + 1); err != nil {
+			if err := p.commit(rec.commitOffset()); err != nil {
 				return err
 			}
 		}
@@ -245,7 +325,7 @@ func (p *Pipeline) run(ctx context.Context, src Source, sink Sink, resumeOffset 
 		p.stats.Emitted++
 	}
 	if processed > 0 {
-		if err := p.commit(p.lastOffset + 1); err != nil {
+		if err := p.commit(p.lastNext); err != nil {
 			return err
 		}
 	}
@@ -276,6 +356,7 @@ func (p *Pipeline) restore(src Source, resumeOffset int64) (int64, error) {
 		buffered[i] = event.MarketEvent{
 			ID: b.ID, Symbol: b.Symbol, Price: b.Price,
 			Volume: b.Volume, Seq: b.Seq, EventTime: b.EventTime,
+			SchemaVer: b.SchemaVersion, Attrs: b.Attrs,
 		}
 	}
 	p.tracker.RestoreBuffered(buffered)
@@ -291,23 +372,49 @@ func (p *Pipeline) restore(src Source, resumeOffset int64) (int64, error) {
 	return offset, src.SeekTo(offset)
 }
 
+// coreFields 是 V1 起就存在的核心字段；其余已声明字段全部归入 MarketEvent.Attrs。
+var coreFields = map[string]bool{
+	FieldID: true, FieldSymbol: true, FieldPrice: true,
+	FieldVolume: true, FieldSeq: true, FieldEventTime: true,
+}
+
+// normalize 先按记录自身版本完成必填/类型校验（不兼容记录在此被拒绝），
+// 再以注册表中最新结构把记录归一化为统一形状：所有已声明字段都会出现，
+// 老版本缺失的新增可选字段补齐为稳定缺省值。
+//
+// 这样无论上游按哪个兼容版本发数，下游拿到的都是"当前所有已声明字段"，
+// 不会因为发数方是旧版本就缺字段；未声明字段在清洗阶段即被忽略。
+// 记录的来源版本仍保留在 MarketEvent.SchemaVer 中以便追溯。
+func (p *Pipeline) normalize(recordSchema schema.Schema, payload map[string]interface{}) (map[string]interface{}, error) {
+	if _, err := recordSchema.Normalize(payload); err != nil {
+		return nil, err
+	}
+	latest, ok := p.registry.Latest()
+	if !ok {
+		return nil, errors.New("registry has no schema registered")
+	}
+	return latest.Normalize(payload)
+}
+
 // process 处理单条记录：校验 -> 去重 -> 迟到判定 -> 缓冲 -> 输出就绪事件。
 func (p *Pipeline) process(rec SourceRecord, sink Sink) error {
 	p.lastOffset = rec.Offset
+	p.lastNext = rec.commitOffset()
+	p.stats.Processed++
 
 	sch, ok := p.registry.Get(rec.SchemaVersion)
 	if !ok {
-		p.record(event.Result{Disposition: event.Rejected, Reason: fmt.Sprintf("unknown schema version %d", rec.SchemaVersion)})
+		p.record(event.Result{Reason: fmt.Sprintf("unknown schema version %d", rec.SchemaVersion), Disposition: event.Rejected})
 		p.stats.Rejected++
 		return nil
 	}
-	norm, err := sch.Normalize(rec.Payload)
+	norm, err := p.normalize(sch, rec.Payload)
 	if err != nil {
-		p.record(event.Result{Disposition: event.Rejected, Reason: err.Error()})
+		p.record(event.Result{Reason: err.Error(), Disposition: event.Rejected})
 		p.stats.Rejected++
 		return nil
 	}
-	ev := toMarketEvent(norm)
+	ev := toMarketEvent(rec.SchemaVersion, norm)
 
 	switch p.dedup.Check(ev) {
 	case dedup.Duplicate:
@@ -326,6 +433,7 @@ func (p *Pipeline) process(rec SourceRecord, sink Sink) error {
 		} else {
 			p.record(event.Result{EventID: ev.ID, Disposition: event.LateDropped, Reason: "correction arrived after emit"})
 			p.stats.LateDropped++
+			return nil
 		}
 	case dedup.New:
 		if p.tracker.IsLate(ev) {
@@ -338,8 +446,20 @@ func (p *Pipeline) process(rec SourceRecord, sink Sink) error {
 		p.stats.Accepted++
 	}
 
+	return p.emitReady(sink)
+}
+
+// emitReady 先按水位线、再按缓冲上界弹出可输出事件，两段均按事件时间升序，
+// 拼接后仍是严格有序序列。
+func (p *Pipeline) emitReady(sink Sink) error {
 	for _, ready := range p.tracker.DrainReady() {
 		if err := sink.Emit(ready); err != nil {
+			return fmt.Errorf("sink emit: %w", err)
+		}
+		p.stats.Emitted++
+	}
+	for _, forced := range p.tracker.DrainOverflow() {
+		if err := sink.Emit(forced); err != nil {
 			return fmt.Errorf("sink emit: %w", err)
 		}
 		p.stats.Emitted++
@@ -363,6 +483,7 @@ func (p *Pipeline) commit(offset int64) error {
 		st.Buffered = append(st.Buffered, checkpoint.BufferedEvent{
 			ID: ev.ID, Symbol: ev.Symbol, Price: ev.Price,
 			Volume: ev.Volume, Seq: ev.Seq, EventTime: ev.EventTime,
+			SchemaVersion: ev.SchemaVer, Attrs: ev.Attrs,
 		})
 	}
 	if err := p.cpStore.Save(st); err != nil {
@@ -384,13 +505,27 @@ func (p *Pipeline) record(r event.Result) {
 }
 
 // toMarketEvent 把清洗后的记录映射为行情事件。
-func toMarketEvent(norm map[string]interface{}) event.MarketEvent {
-	return event.MarketEvent{
+// 核心字段放入固定列；该版本结构中已声明的其余字段（含为旧数据补齐的稳定
+// 缺省值）全部原样进入 Attrs，保证新增字段完整到达下游；未知字段在
+// Normalize 阶段已被剔除，不会出现在这里。
+func toMarketEvent(version int, norm map[string]interface{}) event.MarketEvent {
+	ev := event.MarketEvent{
 		ID:        norm[FieldID].(string),
 		Symbol:    norm[FieldSymbol].(string),
 		Price:     norm[FieldPrice].(float64),
 		Volume:    norm[FieldVolume].(float64),
 		Seq:       uint64(norm[FieldSeq].(int64)),
 		EventTime: norm[FieldEventTime].(time.Time),
+		SchemaVer: version,
 	}
+	attrs := make(map[string]interface{}, len(norm))
+	for k, v := range norm {
+		if !coreFields[k] {
+			attrs[k] = v
+		}
+	}
+	if len(attrs) > 0 {
+		ev.Attrs = attrs
+	}
+	return ev
 }

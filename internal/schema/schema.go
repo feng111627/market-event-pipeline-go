@@ -208,6 +208,12 @@ func coerce(f Field, raw interface{}) (interface{}, error) {
 			}
 		case int64: // Unix 毫秒
 			return time.UnixMilli(v), nil
+		case int: // 内存构造的记录
+			return time.UnixMilli(int64(v)), nil
+		case float64: // JSON 数字解码为 float64；整数毫秒才可无损接受
+			if v == float64(int64(v)) {
+				return time.UnixMilli(int64(v)), nil
+			}
 		}
 	}
 	return nil, fmt.Errorf("field %q: value %v (%T) not assignable to %s", f.Name, raw, raw, f.Type)

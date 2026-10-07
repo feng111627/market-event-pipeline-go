@@ -10,6 +10,10 @@ package dedup
 import (
 	"fmt"
 	"hash/fnv"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/feng111627/market-event-pipeline-go/internal/event"
 )
@@ -65,10 +69,43 @@ func NewStore(maxSize int) *Store {
 }
 
 // Fingerprint 计算事件内容的稳定指纹（不含 ID 与 Seq）。
+// 除核心行情字段外，扩展字段 Attrs（结构演进新增的已声明字段）也纳入指纹，
+// 使"只改扩展字段、不碰核心字段"的版本更新能被正确识别为更正/过期，
+// 而不会被误判成重复投递而静默丢失。
 func Fingerprint(ev event.MarketEvent) uint64 {
 	h := fnv.New64a()
-	fmt.Fprintf(h, "%s|%f|%f|%d", ev.Symbol, ev.Price, ev.Volume, ev.EventTime.UnixNano())
+	fmt.Fprintf(h, "%s|%s|%s|%d|", ev.Symbol,
+		strconv.FormatFloat(ev.Price, 'g', -1, 64),
+		strconv.FormatFloat(ev.Volume, 'g', -1, 64),
+		ev.EventTime.UnixNano())
+	writeAttrs(h, ev.Attrs)
 	return h.Sum64()
+}
+
+// writeAttrs 按字段名排序后稳定写入 attrs，保证指纹可复现。
+// time.Time 统一用 RFC3339Nano 表示；其余类型按 Go 默认可打印形式。
+func writeAttrs(h interface{ Write([]byte) (int, error) }, attrs map[string]interface{}) {
+	if len(attrs) == 0 {
+		return
+	}
+	keys := make([]string, 0, len(attrs))
+	for k := range attrs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		b.WriteString(k)
+		b.WriteByte('=')
+		switch v := attrs[k].(type) {
+		case time.Time:
+			b.WriteString(v.Format(time.RFC3339Nano))
+		default:
+			fmt.Fprint(&b, v)
+		}
+		b.WriteByte(';')
+	}
+	h.Write([]byte(b.String()))
 }
 
 // Check 判定事件，并在需要时更新内部状态。

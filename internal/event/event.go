@@ -42,13 +42,20 @@ func (d Disposition) String() string {
 }
 
 // MarketEvent 是一条行情事件。
+//
+// 核心字段是 V1 起就存在的固定字段；Attrs 承载该事件所属结构版本中
+// **已声明**的其余字段（含后续兼容演进新增的可选字段，以及为其补齐的
+// 稳定缺省值）。结构中未声明的未知字段不会进入 Attrs，在清洗阶段即被忽略。
+// 下游因此可以拿到所有已声明字段，而不会只看到几个核心字段。
 type MarketEvent struct {
-	ID        string    // 全局唯一事件 ID（去重键）
-	Symbol    string    // 标的代码
-	Price     float64   // 成交价
-	Volume    float64   // 成交量
-	Seq       uint64    // 同一 ID 的版本序号，用于更正合并
-	EventTime time.Time // 事件时间（业务发生时间）
+	ID        string                 // 全局唯一事件 ID（去重键）
+	Symbol    string                 // 标的代码
+	Price     float64                // 成交价
+	Volume    float64                // 成交量
+	Seq       uint64                 // 同一 ID 的版本序号，用于更正合并
+	EventTime time.Time              // 事件时间（业务发生时间）
+	SchemaVer int                    // 该事件按哪个结构版本清洗（0 表示未设置）
+	Attrs     map[string]interface{} // 已声明的非核心字段（含缺省值），键为字段名
 }
 
 // Result 是单条事件的处理回执。

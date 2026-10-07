@@ -94,3 +94,41 @@ func TestAtomicWrite(t *testing.T) {
 	}
 	t.Log("用例结果: 半截临时文件被忽略，正式断点完好 [通过]")
 }
+
+// TestBufferedEventAttrsRoundtrip 验证缓冲快照中的扩展字段（含 time.Time）
+// 随断点完整往返，时间类型不丢失，保证恢复后内容指纹一致。
+func TestBufferedEventAttrsRoundtrip(t *testing.T) {
+	t.Log("业务场景: 崩溃时滞留缓冲的事件携带新增字段（含时间类型），断点往返后完整还原")
+	path := filepath.Join(t.TempDir(), "cp.json")
+	s := NewStore(path, 0)
+	when := time.Date(2026, 10, 6, 10, 0, 1, 500, time.UTC)
+	st := State{
+		Offset: 3,
+		Buffered: []BufferedEvent{{
+			ID: "e1", Symbol: "S", Price: 1, Volume: 2, Seq: 1, EventTime: when,
+			SchemaVersion: 3,
+			Attrs: map[string]interface{}{
+				"exchange":  "CB",
+				"is_maker":  true,
+				"venue_mic": "XNMS",
+				"listed_at": when,
+			},
+		}},
+	}
+	if err := s.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := got.Buffered[0]
+	if b.SchemaVersion != 3 || b.Attrs["exchange"] != "CB" || b.Attrs["venue_mic"] != "XNMS" || b.Attrs["is_maker"] != true {
+		t.Fatalf("扩展字段未完整往返: %+v", b.Attrs)
+	}
+	lt, ok := b.Attrs["listed_at"].(time.Time)
+	if !ok || !lt.Equal(when) {
+		t.Fatalf("时间类型扩展字段往返错误: %#v (%T)", b.Attrs["listed_at"], b.Attrs["listed_at"])
+	}
+	t.Logf("用例结果: 4 个扩展字段（含 time.Time）断点往返后类型与值不变 [通过]")
+}

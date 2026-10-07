@@ -87,7 +87,16 @@ func TestNormalize_TimeCoerce(t *testing.T) {
 	if err != nil || !out2["ts"].(time.Time).Equal(out["ts"].(time.Time)) {
 		t.Fatalf("毫秒时间戳转换不一致: %v %v", out2["ts"], err)
 	}
-	t.Log("用例结果: 字符串与毫秒时间戳转换为同一事件时间 [通过]")
+	// JSON 数字解码为 float64：整数毫秒必须可无损接受（外部 JSONL 的主要形态）。
+	out3, err := s.Normalize(map[string]interface{}{"ts": float64(want.UnixMilli())})
+	if err != nil || !out3["ts"].(time.Time).Equal(out["ts"].(time.Time)) {
+		t.Fatalf("float64 毫秒时间戳转换不一致: %v %v", out3["ts"], err)
+	}
+	// 非整数毫秒无法无损表达，明确拒绝。
+	if _, err := s.Normalize(map[string]interface{}{"ts": 1.5}); err == nil {
+		t.Fatal("非整数毫秒时间戳应被拒绝")
+	}
+	t.Log("用例结果: 字符串、整数毫秒与 JSON 数字毫秒转换为同一事件时间，小数毫秒拒绝 [通过]")
 }
 
 // TestCompatibility 覆盖演进规则：允许新增可选字段，拒绝破坏性变更。
