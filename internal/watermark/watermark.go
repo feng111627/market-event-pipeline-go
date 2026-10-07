@@ -4,10 +4,11 @@
 //   - 水位线 = 已见最大事件时间 - 最大乱序容忍（maxOutOfOrderness）。
 //   - 事件时间 <= 水位线 - 允许迟到宽限（allowedLateness）的事件判定为迟到，丢弃。
 //   - 其余事件进入最小堆缓冲，事件时间 <= 水位线时按序弹出。
+//   - 缓冲容量有硬上界（maxBuffer）：超限时最小事件时间的事件被强制提前
+//     输出，并抬高"已输出地板"，使内存与输入规模解耦且输出仍按事件时间非降序。
 package watermark
 
 import (
-	"container/heap"
 	"time"
 
 	"github.com/feng111627/market-event-pipeline-go/internal/event"
@@ -17,19 +18,23 @@ import (
 type Tracker struct {
 	maxOutOfOrderness time.Duration
 	allowedLateness   time.Duration
+	maxBuffer         int // 乱序缓冲容量硬上界（<=0 表示不限）
 	maxSeen           time.Time
 	hasSeen           bool
-	buf               eventHeap
-	index             map[string]int // ID -> 堆下标，用于更正合并时定位旧版本
+	emittedFloor      time.Time // 因缓冲上界强制输出过的最大事件时间
+	hasFloor          bool
+	buf               *indexedHeap
 }
 
 // NewTracker 创建水位线跟踪器。
-func NewTracker(maxOutOfOrderness, allowedLateness time.Duration) *Tracker {
+// maxBuffer 为乱序缓冲容量硬上界（<=0 表示不限）；缓冲超限时最旧事件
+// （最小事件时间）会被强制提前输出，内存占用因此与输入规模解耦。
+func NewTracker(maxOutOfOrderness, allowedLateness time.Duration, maxBuffer int) *Tracker {
 	return &Tracker{
 		maxOutOfOrderness: maxOutOfOrderness,
 		allowedLateness:   allowedLateness,
-		buf:               eventHeap{},
-		index:             make(map[string]int),
+		maxBuffer:         maxBuffer,
+		buf:               newIndexedHeap(),
 	}
 }
 
@@ -42,32 +47,46 @@ func (t *Tracker) Watermark() time.Time {
 }
 
 // IsLate 判定事件是否已超出可容忍的迟到范围（应丢弃）。
+// 同时不允许事件时间早于因缓冲上界强制输出的"地板"，从而保证即使
+// 发生强制提前输出，最终输出仍是事件时间非降序。
 func (t *Tracker) IsLate(ev event.MarketEvent) bool {
 	if !t.hasSeen {
 		return false
+	}
+	if t.hasFloor && ev.EventTime.Before(t.emittedFloor) {
+		return true
 	}
 	deadline := t.Watermark().Add(-t.allowedLateness)
 	return !ev.EventTime.After(deadline)
 }
 
 // Add 将事件放入重排缓冲，并推进 maxSeen。
-func (t *Tracker) Add(ev event.MarketEvent) {
+// 若缓冲超过容量上界，弹出最旧事件作为强制输出返回（ok=true），
+// 同时抬高已输出地板，保证输出事件时间非降序。
+func (t *Tracker) Add(ev event.MarketEvent) (forced event.MarketEvent, ok bool) {
 	if !t.hasSeen || ev.EventTime.After(t.maxSeen) {
 		t.maxSeen = ev.EventTime
 		t.hasSeen = true
 	}
-	heap.Push(&t.buf, ev)
-	t.reindex()
+	t.buf.push(ev)
+	if t.maxBuffer > 0 && t.buf.Len() > t.maxBuffer {
+		oldest := t.buf.pop()
+		if !t.hasFloor || oldest.EventTime.After(t.emittedFloor) {
+			t.emittedFloor = oldest.EventTime
+			t.hasFloor = true
+		}
+		return oldest, true
+	}
+	return event.MarketEvent{}, false
 }
 
 // Remove 从缓冲中移除指定 ID 的事件（用于更正合并时替换旧版本）。
 func (t *Tracker) Remove(id string) bool {
-	i, ok := t.index[id]
+	i, ok := t.buf.indexOf(id)
 	if !ok {
 		return false
 	}
-	heap.Remove(&t.buf, i)
-	t.reindex()
+	t.buf.removeAt(i)
 	return true
 }
 
@@ -75,10 +94,9 @@ func (t *Tracker) Remove(id string) bool {
 func (t *Tracker) DrainReady() []event.MarketEvent {
 	var out []event.MarketEvent
 	wm := t.Watermark()
-	for t.buf.Len() > 0 && !t.buf[0].EventTime.After(wm) {
-		out = append(out, heap.Pop(&t.buf).(event.MarketEvent))
+	for t.buf.Len() > 0 && !t.buf.items[0].EventTime.After(wm) {
+		out = append(out, t.buf.pop())
 	}
-	t.reindex()
 	return out
 }
 
@@ -86,30 +104,19 @@ func (t *Tracker) DrainReady() []event.MarketEvent {
 func (t *Tracker) Flush() []event.MarketEvent {
 	out := make([]event.MarketEvent, 0, t.buf.Len())
 	for t.buf.Len() > 0 {
-		out = append(out, heap.Pop(&t.buf).(event.MarketEvent))
+		out = append(out, t.buf.pop())
 	}
-	t.reindex()
 	return out
 }
 
 // Buffered 返回当前缓冲中的事件数。
-func (t *Tracker) Buffered() int {
-	return t.buf.Len()
-}
+func (t *Tracker) Buffered() int { return t.buf.Len() }
 
 // Snapshot 导出缓冲中的事件（用于断点持久化），不保证顺序。
-func (t *Tracker) Snapshot() []event.MarketEvent {
-	out := make([]event.MarketEvent, len(t.buf))
-	copy(out, t.buf)
-	return out
-}
+func (t *Tracker) Snapshot() []event.MarketEvent { return t.buf.snapshot() }
 
 // RestoreBuffered 从断点恢复重排缓冲内容。
-func (t *Tracker) RestoreBuffered(evs []event.MarketEvent) {
-	t.buf = append(t.buf[:0], evs...)
-	heap.Init(&t.buf)
-	t.reindex()
-}
+func (t *Tracker) RestoreBuffered(evs []event.MarketEvent) { t.buf.init(evs) }
 
 // SetMaxSeen 恢复断点时直接设置已见最大事件时间。
 func (t *Tracker) SetMaxSeen(ts time.Time) {
@@ -118,14 +125,15 @@ func (t *Tracker) SetMaxSeen(ts time.Time) {
 }
 
 // MaxSeen 返回已见的最大事件时间。
-func (t *Tracker) MaxSeen() time.Time {
-	return t.maxSeen
+func (t *Tracker) MaxSeen() time.Time { return t.maxSeen }
+
+// EmittedFloor 返回因缓冲上界强制输出过的最大事件时间（零值表示未发生过）。
+func (t *Tracker) EmittedFloor() (time.Time, bool) {
+	return t.emittedFloor, t.hasFloor
 }
 
-// reindex 重建 ID -> 堆下标映射。缓冲规模受水位线窗口约束，重建开销可接受。
-func (t *Tracker) reindex() {
-	t.index = make(map[string]int, len(t.buf))
-	for i := range t.buf {
-		t.index[t.buf[i].ID] = i
-	}
+// SetEmittedFloor 恢复断点时还原因缓冲上界强制输出形成的地板。
+func (t *Tracker) SetEmittedFloor(ts time.Time, valid bool) {
+	t.emittedFloor = ts
+	t.hasFloor = valid
 }

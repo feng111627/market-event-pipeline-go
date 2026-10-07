@@ -23,22 +23,111 @@ var ErrRollback = errors.New("checkpoint rollback rejected")
 
 // State 是一次断点的完整内容。
 type State struct {
-	Offset     int64                 // 已提交的源位点（下一条待读）
-	Watermark  time.Time             // 已提交的水位线基准（maxSeen）
-	DedupState map[string]DedupEntry // 去重状态快照
-	Buffered   []BufferedEvent       // 已处理但未输出（滞留在重排缓冲）的事件
-	Committed  time.Time             // 断点提交时间
-	Generation uint64                // 单调递增的代际号
+	Offset       int64                 // 已提交的源位点（下一条待读）
+	SinkOffset   int64                 // 已提交且已持久化到 sink 的字节位点（支持输出截断重放）
+	Watermark    time.Time             // 已提交的水位线基准（maxSeen）
+	EmittedFloor time.Time             // 因缓冲上界强制输出形成的事件时间地板
+	HasFloor     bool                  // EmittedFloor 是否有效
+	DedupState   map[string]DedupEntry // 去重状态快照
+	Buffered     []BufferedEvent       // 已处理但未输出（滞留在重排缓冲）的事件
+	Committed    time.Time             // 断点提交时间
+	Generation   uint64                // 单调递增的代际号
 }
 
 // BufferedEvent 是重排缓冲中事件的可序列化形式。
 type BufferedEvent struct {
-	ID        string    `json:"id"`
-	Symbol    string    `json:"symbol"`
-	Price     float64   `json:"price"`
-	Volume    float64   `json:"volume"`
-	Seq       uint64    `json:"seq"`
-	EventTime time.Time `json:"event_time"`
+	SchemaVersion int                    `json:"schema_version,omitempty"`
+	ID            string                 `json:"id"`
+	Symbol        string                 `json:"symbol"`
+	Price         float64                `json:"price"`
+	Volume        float64                `json:"volume"`
+	Seq           uint64                 `json:"seq"`
+	EventTime     time.Time              `json:"event_time"`
+	Attrs         map[string]interface{} `json:"attrs,omitempty"` // 全部已声明扩展字段
+}
+
+// timeMarkerKey / intMarkerKey 用于在 JSON 中标记带类型的扩展字段。
+// Attrs 中只会出现标量（string/float64/int64/bool/time.Time），
+// 不可能出现同名嵌套对象，因此这些标记无歧义。
+const (
+	timeMarkerKey = "__time__"
+	intMarkerKey  = "__int__"
+)
+
+// MarshalJSON 自定义编码：Attrs 中的 time.Time / int64 用标记对象包裹，
+// 保证恢复后下游拿到的值类型不变（语义可复现，int64 不会退化为 float64）。
+func (b BufferedEvent) MarshalJSON() ([]byte, error) {
+	type alias BufferedEvent
+	return json.Marshal(struct {
+		alias
+		Attrs map[string]interface{} `json:"attrs,omitempty"`
+	}{
+		alias: alias(b),
+		Attrs: encodeAttrs(b.Attrs),
+	})
+}
+
+// UnmarshalJSON 自定义解码：还原 time.Time / int64 标记。
+func (b *BufferedEvent) UnmarshalJSON(data []byte) error {
+	type alias BufferedEvent
+	aux := struct {
+		alias
+		Attrs map[string]interface{} `json:"attrs,omitempty"`
+	}{}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*b = BufferedEvent(aux.alias)
+	b.Attrs = decodeAttrs(aux.Attrs)
+	return nil
+}
+
+// encodeAttrs 把 time.Time 编码为 {"__time__": "..."}，
+// int64 编码为 {"__int__": 数值}。
+func encodeAttrs(attrs map[string]interface{}) map[string]interface{} {
+	if len(attrs) == 0 {
+		return nil
+	}
+	out := make(map[string]interface{}, len(attrs))
+	for k, v := range attrs {
+		switch x := v.(type) {
+		case time.Time:
+			out[k] = map[string]string{timeMarkerKey: x.Format(time.RFC3339Nano)}
+		case int64:
+			out[k] = map[string]int64{intMarkerKey: x}
+		default:
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// decodeAttrs 还原 time.Time / int64 标记，其余值保持 JSON 默认类型。
+func decodeAttrs(attrs map[string]interface{}) map[string]interface{} {
+	if len(attrs) == 0 {
+		return nil
+	}
+	out := make(map[string]interface{}, len(attrs))
+	for k, v := range attrs {
+		if m, ok := v.(map[string]interface{}); ok {
+			if raw, isTime := m[timeMarkerKey]; isTime && len(m) == 1 {
+				if s, ok := raw.(string); ok {
+					if ts, err := time.Parse(time.RFC3339Nano, s); err == nil {
+						out[k] = ts
+						continue
+					}
+				}
+			}
+			if raw, isInt := m[intMarkerKey]; isInt && len(m) == 1 {
+				if f, ok := raw.(float64); ok {
+					out[k] = int64(f)
+					continue
+				}
+			}
+		}
+		out[k] = v
+	}
+	return out
 }
 
 // DedupEntry 是去重状态的可序列化条目。
@@ -49,12 +138,15 @@ type DedupEntry struct {
 
 // stateFile 是磁盘上的序列化形式。
 type stateFile struct {
-	Offset     int64                 `json:"offset"`
-	Watermark  time.Time             `json:"watermark"`
-	DedupState map[string]DedupEntry `json:"dedup_state"`
-	Buffered   []BufferedEvent       `json:"buffered"`
-	Committed  time.Time             `json:"committed"`
-	Generation uint64                `json:"generation"`
+	Offset       int64                 `json:"offset"`
+	SinkOffset   int64                 `json:"sink_offset"`
+	Watermark    time.Time             `json:"watermark"`
+	EmittedFloor time.Time             `json:"emitted_floor,omitempty"`
+	HasFloor     bool                  `json:"has_floor,omitempty"`
+	DedupState   map[string]DedupEntry `json:"dedup_state"`
+	Buffered     []BufferedEvent       `json:"buffered"`
+	Committed    time.Time             `json:"committed"`
+	Generation   uint64                `json:"generation"`
 }
 
 // Store 是断点的文件存储。
@@ -80,12 +172,15 @@ func (s *Store) Save(st State) error {
 		st.Committed = s.now()
 	}
 	f := stateFile{
-		Offset:     st.Offset,
-		Watermark:  st.Watermark,
-		DedupState: st.DedupState,
-		Buffered:   st.Buffered,
-		Committed:  st.Committed,
-		Generation: st.Generation,
+		Offset:       st.Offset,
+		SinkOffset:   st.SinkOffset,
+		Watermark:    st.Watermark,
+		EmittedFloor: st.EmittedFloor,
+		HasFloor:     st.HasFloor,
+		DedupState:   st.DedupState,
+		Buffered:     st.Buffered,
+		Committed:    st.Committed,
+		Generation:   st.Generation,
 	}
 	data, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {
@@ -121,12 +216,15 @@ func (s *Store) Load() (*State, error) {
 		return nil, fmt.Errorf("%w: committed %s, ttl %s", ErrExpired, f.Committed, s.ttl)
 	}
 	return &State{
-		Offset:     f.Offset,
-		Watermark:  f.Watermark,
-		DedupState: f.DedupState,
-		Buffered:   f.Buffered,
-		Committed:  f.Committed,
-		Generation: f.Generation,
+		Offset:       f.Offset,
+		SinkOffset:   f.SinkOffset,
+		Watermark:    f.Watermark,
+		EmittedFloor: f.EmittedFloor,
+		HasFloor:     f.HasFloor,
+		DedupState:   f.DedupState,
+		Buffered:     f.Buffered,
+		Committed:    f.Committed,
+		Generation:   f.Generation,
 	}, nil
 }
 

@@ -77,3 +77,29 @@ func TestSnapshotRestore(t *testing.T) {
 	}
 	t.Log("用例结果: 快照恢复后重复判定保持一致 [通过]")
 }
+
+// TestAttrsAffectVerdict 验证扩展字段参与指纹：只改扩展字段、seq 更新的
+// 更正版本必须判为 CORRECTION 而不是 DUPLICATE。
+func TestAttrsAffectVerdict(t *testing.T) {
+	t.Log("业务场景: 上游只修改了新增扩展字段（更正），去重判定必须感知 Attrs")
+	s := NewStore(100)
+	base := ev("e1", 1, 100)
+	base.Attrs = map[string]interface{}{"exchange": "A", "is_maker": false}
+	if v := s.Check(base); v != New {
+		t.Fatalf("首次应为 NEW, 得到 %v", v)
+	}
+	// 完全一致（含 attrs）-> 重复。
+	dup := ev("e1", 1, 100)
+	dup.Attrs = map[string]interface{}{"exchange": "A", "is_maker": false}
+	if v := s.Check(dup); v != Duplicate {
+		t.Fatalf("核心与扩展字段都一致应为 DUPLICATE, 得到 %v", v)
+	}
+	t.Log("用例结果: 核心+扩展字段完全一致 -> DUPLICATE [通过]")
+	// 只改扩展字段且 seq 更新 -> 更正。
+	corr := ev("e1", 2, 100)
+	corr.Attrs = map[string]interface{}{"exchange": "B", "is_maker": true}
+	if v := s.Check(corr); v != Correction {
+		t.Fatalf("仅扩展字段变化且 seq 更新应为 CORRECTION, 得到 %v", v)
+	}
+	t.Log("用例结果: 仅扩展字段变化且 seq 更新 -> CORRECTION（指纹纳入 Attrs） [通过]")
+}

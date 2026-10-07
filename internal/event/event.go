@@ -49,7 +49,20 @@ type MarketEvent struct {
 	Volume    float64   // 成交量
 	Seq       uint64    // 同一 ID 的版本序号，用于更正合并
 	EventTime time.Time // 事件时间（业务发生时间）
+	// Attrs 承载该事件对应结构版本中除核心字段外的全部已声明字段
+	// （按最新注册结构清洗后的值）。结构未声明的字段不会出现在这里。
+	// key 为字段名，value 的 Go 类型由 schema 清洗决定
+	// （string/float64/int64/bool/time.Time）。
+	Attrs map[string]interface{}
+	// schemaVersion 记录该事件所使用的结构版本，供输出标注（内部字段）。
+	schemaVersion int
 }
+
+// SchemaVersion 返回事件处理时使用的结构版本。
+func (m MarketEvent) SchemaVersion() int { return m.schemaVersion }
+
+// SetSchemaVersion 由流水线在清洗后设置结构版本。
+func (m *MarketEvent) SetSchemaVersion(v int) { m.schemaVersion = v }
 
 // Result 是单条事件的处理回执。
 type Result struct {

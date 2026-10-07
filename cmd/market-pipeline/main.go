@@ -1,101 +1,167 @@
-// market-pipeline 是行情事件流处理组件的可运行演示入口。
-// 它构造一批含乱序、重复、更正与迟到的模拟行情事件，
-// 运行流水线并打印每条事件的处置结论与最终按事件时间排序的输出。
+// market-pipeline 是行情事件流处理组件的命令行入口。
+//
+// 从文件或标准输入按行读取带结构版本的 JSON 行情记录，按事件时间
+// 清洗、去重、重排后有序写入文件或标准输出，并打印本次处理汇总。
+//
+// 用法示例：
+//
+//	# 文件 -> 文件
+//	market-pipeline -input ticks.jsonl -output out.jsonl
+//	# 标准输入 -> 标准输出（一次性，不做断点恢复）
+//	cat ticks.jsonl | market-pipeline
+//	# 内置演示
+//	market-pipeline -demo
 package main
 
 import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"os"
 	"time"
 
-	"github.com/feng111627/market-event-pipeline-go/internal/event"
+	"github.com/feng111627/market-event-pipeline-go/internal/jsonio"
 	"github.com/feng111627/market-event-pipeline-go/internal/pipeline"
 	"github.com/feng111627/market-event-pipeline-go/internal/schema"
 )
 
-var base = time.Date(2026, 10, 6, 10, 0, 0, 0, time.UTC)
-
-// demoSource 依次吐出预置的模拟记录。
-type demoSource struct {
-	recs []pipeline.SourceRecord
-	pos  int64
+type options struct {
+	demo         bool
+	input        string
+	output       string
+	checkpoint   string
+	noCheckpoint bool
+	oooo         time.Duration
+	lateness     time.Duration
+	maxBuffer    int
+	dedupCap     int
+	bufSize      int
+	cpEvery      int
+	ttl          time.Duration
 }
 
-func (s *demoSource) Next() (pipeline.SourceRecord, bool) {
-	if int(s.pos) >= len(s.recs) {
-		return pipeline.SourceRecord{}, false
-	}
-	r := s.recs[s.pos]
-	s.pos++
-	return r, true
-}
-
-func (s *demoSource) SeekTo(offset int64) error {
-	s.pos = offset
-	return nil
-}
-
-// printSink 打印每条按事件时间输出的行情事件。
-type printSink struct{ n int }
-
-func (p *printSink) Emit(ev event.MarketEvent) error {
-	p.n++
-	fmt.Printf("[输出 #%02d] id=%s symbol=%s price=%.2f vol=%.2f event_time=%s\n",
-		p.n, ev.ID, ev.Symbol, ev.Price, ev.Volume, ev.EventTime.Format("15:04:05"))
-	return nil
-}
-
-func mkRec(offset int64, version int, id string, seq int64, sec int, price float64) pipeline.SourceRecord {
-	return pipeline.SourceRecord{
-		Offset:        offset,
-		SchemaVersion: version,
-		Payload: map[string]interface{}{
-			"id": id, "symbol": "BTCUSDT", "price": price, "volume": 1.5,
-			"seq": seq, "event_time": base.Add(time.Duration(sec) * time.Second),
-		},
-	}
-}
-
-func main() {
-	cpPath := flag.String("checkpoint", "data/checkpoint.json", "断点文件路径")
+func parseFlags() options {
+	var o options
+	flag.BoolVar(&o.demo, "demo", false, "运行内置演示样例")
+	flag.StringVar(&o.input, "input", jsonio.StdinPath, "输入文件路径（- 表示标准输入）")
+	flag.StringVar(&o.output, "output", jsonio.StdoutPath, "输出文件路径（- 表示标准输出）")
+	flag.StringVar(&o.checkpoint, "checkpoint", "data/checkpoint.json", "断点文件路径")
+	flag.BoolVar(&o.noCheckpoint, "no-checkpoint", false, "禁用断点持久化（一次性运行）")
+	flag.DurationVar(&o.oooo, "max-out-of-order", 5*time.Second, "允许的最大乱序时长")
+	flag.DurationVar(&o.lateness, "allowed-lateness", 1*time.Second, "水位线后允许的迟到宽限")
+	flag.IntVar(&o.maxBuffer, "max-buffer", 100000, "乱序重排缓冲容量硬上界（内存上界，<=0 不限）")
+	flag.IntVar(&o.dedupCap, "dedup-capacity", 100000, "去重表容量上界")
+	flag.IntVar(&o.bufSize, "input-buffer", 1024, "输入通道容量（背压边界）")
+	flag.IntVar(&o.cpEvery, "checkpoint-every", 500, "每处理多少行提交一次断点")
+	flag.DurationVar(&o.ttl, "checkpoint-ttl", 24*time.Hour, "断点有效期（0 表示不过期）")
 	flag.Parse()
+	return o
+}
 
+// registry 注册当前支持的全部兼容结构版本。
+func registry() *schema.Registry {
 	reg := schema.NewRegistry()
-	for _, s := range []schema.Schema{pipeline.MarketEventSchemaV1(), pipeline.MarketEventSchemaV2()} {
+	for _, s := range []schema.Schema{
+		pipeline.MarketEventSchemaV1(),
+		pipeline.MarketEventSchemaV2(),
+		pipeline.MarketEventSchemaV3(),
+	} {
 		if err := reg.Register(s); err != nil {
 			log.Fatalf("注册结构失败: %v", err)
 		}
 	}
+	return reg
+}
 
+func main() {
+	o := parseFlags()
+	if o.demo {
+		if err := runDemo(o.checkpoint); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if err := runBatch(o); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func runBatch(o options) error {
 	cfg := pipeline.DefaultConfig()
-	cfg.CheckpointPath = *cpPath
+	cfg.MaxOutOfOrderness = o.oooo
+	cfg.AllowedLateness = o.lateness
+	cfg.MaxBufferSize = o.maxBuffer
+	cfg.DedupCapacity = o.dedupCap
+	cfg.InputBufferSize = o.bufSize
+	cfg.CheckpointEvery = o.cpEvery
+	cfg.CheckpointTTL = o.ttl
 
-	// 模拟上游：乱序、重复投递、版本更正、迟到、V2 结构（缺新字段）。
-	src := &demoSource{recs: []pipeline.SourceRecord{
-		mkRec(0, 1, "tick-03", 1, 13, 30100),
-		mkRec(1, 1, "tick-01", 1, 11, 30000), // 乱序：窗口内，等待
-		mkRec(2, 1, "tick-01", 1, 11, 30000), // 重复投递：丢弃
-		mkRec(3, 1, "tick-02", 1, 12, 30050),
-		mkRec(4, 1, "tick-02", 2, 12, 30055), // 更正：合并替换
-		mkRec(5, 2, "tick-04", 1, 14, 30120), // V2 结构，exchange 取缺省值
-		mkRec(6, 1, "tick-05", 1, 25, 30200), // 推进水位线，弹出前面事件
-		mkRec(7, 1, "tick-00", 1, 10, 29900), // 迟到：丢弃
-	}}
+	stdin := o.input == jsonio.StdinPath
+	stdout := o.output == jsonio.StdoutPath
+	// 标准输入不可重读、标准输出不可截断，二者参与的运行都是一次性的，
+	// 不做断点，也就不会出现"重跑得到半份结果"的歧义。
+	ephemeral := o.noCheckpoint || stdin || stdout
+	if ephemeral {
+		cfg.CheckpointPath = ""
+	} else {
+		cfg.CheckpointPath = o.checkpoint
+	}
 
-	p := pipeline.New(cfg, reg)
-	sink := &printSink{}
+	src, err := jsonio.OpenFileSource(o.input)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	sink, err := jsonio.OpenFileSink(o.output)
+	if err != nil {
+		return err
+	}
+	defer sink.Close()
+
+	p := pipeline.New(cfg, registry())
 	if err := p.Run(context.Background(), src, sink); err != nil {
-		log.Fatalf("流水线运行失败: %v", err)
+		return fmt.Errorf("流水线运行失败: %w", err)
 	}
 
-	fmt.Println("\n--- 单条处置回执 ---")
-	for _, r := range p.Results() {
-		fmt.Printf("id=%-8s 结论=%-18s 原因=%s\n", r.EventID, r.Disposition, r.Reason)
-	}
-	fmt.Printf("\n--- 运行统计 ---\n%+v\n", p.Stats())
-	fmt.Printf("断点已写入: %s\n", *cpPath)
+	// 汇总打到标准错误：输出到 stdout 时数据与报告分流，便于下游只取数据。
+	printSummaryTo(os.Stderr, o, p.Stats())
+	return nil
+}
 
-	var _ = event.Accepted // 保持 event 包引用（处置枚举见回执输出）
+// summaryLine 用中文标签给出每种处置结论的计数。
+func summaryLines(st pipeline.Stats) []string {
+	total := st.Accepted + st.Duplicates + st.Stales + st.Merged + st.LateDropped + st.Rejected
+	return []string{
+		fmt.Sprintf("输入总行数(processed)   : %d", st.Processed),
+		fmt.Sprintf("处置合计                : %d", total),
+		fmt.Sprintf("正常接收 ACCEPTED       : %d", st.Accepted),
+		fmt.Sprintf("重复丢弃 DUPLICATE      : %d", st.Duplicates),
+		fmt.Sprintf("过期丢弃 STALE          : %d", st.Stales),
+		fmt.Sprintf("合并更正 MERGED         : %d", st.Merged),
+		fmt.Sprintf("迟到丢弃 LATE_DROPPED   : %d", st.LateDropped),
+		fmt.Sprintf("明确拒绝 REJECTED       : %d", st.Rejected),
+		fmt.Sprintf("最终输出行数(emitted)   : %d", st.Emitted),
+		fmt.Sprintf("缓冲超限强制输出        : %d", st.ForcedEmitted),
+		fmt.Sprintf("乱序缓冲峰值            : %d", st.BufferedMax),
+		fmt.Sprintf("断点提交次数            : %d", st.Checkpoints),
+	}
+}
+
+func printSummary(st pipeline.Stats) { printSummaryTo(os.Stdout, options{demo: true}, st) }
+
+func printSummaryTo(w io.Writer, o options, st pipeline.Stats) {
+	fmt.Fprintln(w, "--- 运行汇总 ---")
+	for _, l := range summaryLines(st) {
+		fmt.Fprintln(w, l)
+	}
+	if !o.demo {
+		mode := "持久化(断点恢复)"
+		if ephemeral := o.noCheckpoint || o.input == jsonio.StdinPath || o.output == jsonio.StdoutPath; ephemeral {
+			mode = "一次性(无断点：stdin/stdout 或显式禁用)"
+		}
+		fmt.Fprintf(w, "运行模式                : %s\n", mode)
+	}
 }

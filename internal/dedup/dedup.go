@@ -10,6 +10,9 @@ package dedup
 import (
 	"fmt"
 	"hash/fnv"
+	"sort"
+	"strings"
+	"time"
 
 	"github.com/feng111627/market-event-pipeline-go/internal/event"
 )
@@ -65,10 +68,48 @@ func NewStore(maxSize int) *Store {
 }
 
 // Fingerprint 计算事件内容的稳定指纹（不含 ID 与 Seq）。
+// 核心字段与全部已声明扩展字段（Attrs）都参与指纹，因此只改扩展字段的
+// 更正版本不会被误判为重复投递。
 func Fingerprint(ev event.MarketEvent) uint64 {
 	h := fnv.New64a()
 	fmt.Fprintf(h, "%s|%f|%f|%d", ev.Symbol, ev.Price, ev.Volume, ev.EventTime.UnixNano())
+	if len(ev.Attrs) > 0 {
+		keys := make([]string, 0, len(ev.Attrs))
+		for k := range ev.Attrs {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		var b strings.Builder
+		for _, k := range keys {
+			b.WriteByte('|')
+			b.WriteString(k)
+			b.WriteByte('=')
+			writeAttrForHash(&b, ev.Attrs[k])
+		}
+		h.Write([]byte(b.String()))
+	}
 	return h.Sum64()
+}
+
+// writeAttrForHash 以稳定的字符串形式写入扩展字段值。
+func writeAttrForHash(b *strings.Builder, v interface{}) {
+	switch x := v.(type) {
+	case time.Time:
+		b.WriteString("t:")
+		b.WriteString(x.UTC().Format(time.RFC3339Nano))
+	case string:
+		b.WriteString("s:")
+		b.WriteString(x)
+	case float64:
+		b.WriteString(fmt.Sprintf("f:%.17g", x))
+	case int64:
+		b.WriteString(fmt.Sprintf("i:%d", x))
+	case bool:
+		b.WriteString(fmt.Sprintf("b:%t", x))
+	default:
+		b.WriteString("?:")
+		b.WriteString(fmt.Sprintf("%v", x))
+	}
 }
 
 // Check 判定事件，并在需要时更新内部状态。

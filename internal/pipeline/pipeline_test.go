@@ -314,3 +314,161 @@ func mustLoad(t *testing.T, path string) *checkpoint.State {
 	}
 	return st
 }
+
+// recV3 构造带 V3 扩展字段的记录。
+func recV3(offset int64, id string, seq int64, sec int, attrs map[string]interface{}) SourceRecord {
+	payload := map[string]interface{}{
+		FieldID: id, FieldSymbol: "BTCUSDT", FieldPrice: 100.0,
+		FieldVolume: 1.0, FieldSeq: seq, FieldEventTime: base.Add(time.Duration(sec) * time.Second),
+	}
+	for k, v := range attrs {
+		payload[k] = v
+	}
+	return SourceRecord{Offset: offset, SchemaVersion: 3, Payload: payload}
+}
+
+// TestAttrsSurviveCheckpoint 验证扩展字段与结构版本随缓冲快照进断点、
+// 恢复后输出到 sink 的事件仍带全部字段与正确版本（透传不被断点截断）。
+// TestAttrsSurviveCheckpoint 验证扩展字段与结构版本随缓冲快照进断点、
+// 恢复后输出到 sink 的事件仍带全部字段与正确版本（透传不被断点截断）。
+func TestAttrsSurviveCheckpoint(t *testing.T) {
+	t.Log("业务场景: V3 事件滞留在乱序缓冲中入断点，崩溃恢复后下游仍拿到全部新字段与版本")
+	cfg := testConfig(t)
+	cfg.CheckpointEvery = 1 // 第一条处理完即提交断点（事件仍在缓冲内）
+	cfg.MaxOutOfOrderness = time.Hour
+	cfg.AllowedLateness = time.Hour
+	recs := []SourceRecord{
+		recV3(0, "e1", 1, 5, map[string]interface{}{"is_maker": true, "venue_id": int64(7)}),
+		recV3(1, "e2", 1, 6, nil),
+	}
+
+	// 第一次运行：第一条处理完并提交断点后，源在第二条处阻塞；测试在确认
+	// 断点已落盘后再取消 ctx，确定性模拟"已提交、未收尾"的崩溃。
+	p1 := New(cfg, testRegistryV3(t))
+	ctx, cancel := context.WithCancel(context.Background())
+	sink1 := newMemSink()
+	committed := make(chan struct{})
+	src1 := &blockingAfterFirstSource{recs: recs, onBlock: func() {
+		waitFor(t, func() bool { return p1.Stats().Checkpoints >= 1 })
+		close(committed)
+	}}
+	go func() {
+		<-committed
+		cancel()
+	}()
+	if err := p1.Run(ctx, src1, sink1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("第一次运行应被取消, 得到 %v", err)
+	}
+
+	cp := mustLoad(t, cfg.CheckpointPath)
+	if len(cp.Buffered) != 1 {
+		t.Fatalf("断点缓冲应含 1 条（大窗口下未提前输出）, 得到 %d", len(cp.Buffered))
+	}
+	if cp.Buffered[0].SchemaVersion != 3 {
+		t.Fatalf("缓冲快照版本=%d, 期望 3", cp.Buffered[0].SchemaVersion)
+	}
+	if cp.Buffered[0].Attrs["is_maker"] != true || cp.Buffered[0].Attrs["venue_id"] != int64(7) {
+		t.Fatalf("缓冲快照扩展字段丢失: %+v", cp.Buffered[0].Attrs)
+	}
+	if cp.Buffered[0].Attrs["exchange"] != "UNKNOWN" {
+		t.Fatalf("缺省扩展字段 exchange 未进快照: %+v", cp.Buffered[0].Attrs)
+	}
+
+	// 用全新 pipeline 从断点恢复并跑完（幂等 sink）。
+	p2 := New(cfg, testRegistryV3(t))
+	sink2 := newMemSink()
+	if err := p2.Resume(context.Background(), &sliceSource{recs: recs}, sink2, -1); err != nil {
+		t.Fatalf("Resume 失败: %v", err)
+	}
+	if len(sink2.events) != 2 {
+		t.Fatalf("恢复后应输出 2 条, 得到 %d", len(sink2.events))
+	}
+	got := sink2.events[0]
+	if got.SchemaVersion() != 3 || got.Attrs["is_maker"] != true ||
+		got.Attrs["venue_id"] != int64(7) || got.Attrs["exchange"] != "UNKNOWN" {
+		t.Fatalf("恢复后扩展字段/版本不完整: version=%d attrs=%+v", got.SchemaVersion(), got.Attrs)
+	}
+	t.Logf("用例结果: V3 事件经断点缓冲快照恢复，版本与全部扩展字段（含缺省）完整到达 sink [通过] attrs=%+v", got.Attrs)
+}
+func TestBoundedBufferForcesAndDropsLate(t *testing.T) {
+	t.Log("业务场景: 乱序持续超过缓冲上界，触发强制输出并对超地板的更旧事件判迟到")
+	cfg := testConfig(t)
+	cfg.MaxOutOfOrderness = time.Hour // 排除常规水位线迟到
+	cfg.AllowedLateness = 0
+	cfg.MaxBufferSize = 3
+	var recs []SourceRecord
+	// 逆序投递 6 个事件时间唯一的事件。
+	for i := 0; i < 6; i++ {
+		recs = append(recs, rec(int64(i), 1, fmt.Sprintf("e%02d", i), 1, 9-i, 100))
+	}
+	p := New(cfg, testRegistry(t))
+	sink := newMemSink()
+	if err := p.Run(context.Background(), &sliceSource{recs: recs}, sink); err != nil {
+		t.Fatalf("Run 失败: %v", err)
+	}
+	st := p.Stats()
+	if st.BufferedMax > 3 {
+		t.Fatalf("缓冲峰值=%d 超过上界 3", st.BufferedMax)
+	}
+	if st.ForcedEmitted < 1 {
+		t.Fatal("应触发强制输出")
+	}
+	// 输出（含强制 + 收尾 flush）必须按事件时间非降序。
+	var prev time.Time
+	for i, ev := range sink.events {
+		if i > 0 && ev.EventTime.Before(prev) {
+			t.Fatalf("输出失去事件时间顺序: %s < %s", ev.EventTime, prev)
+		}
+		prev = ev.EventTime
+	}
+	t.Logf("用例结果: 缓冲峰值=%d、强制输出=%d、输出 %d 条有序，统计=%+v [通过]",
+		st.BufferedMax, st.ForcedEmitted, len(sink.events), st)
+}
+
+// blockingAfterFirstSource 返回第一条后，在第二次 Next 回调 onBlock 并阻塞，
+// 用于在"第一条已处理且提交断点"后确定性地注入取消。
+type blockingAfterFirstSource struct {
+	recs    []SourceRecord
+	pos     int64
+	onBlock func()
+}
+
+func (s *blockingAfterFirstSource) Next() (SourceRecord, bool) {
+	if s.pos == 1 {
+		if s.onBlock != nil {
+			s.onBlock()
+		}
+		time.Sleep(200 * time.Millisecond) // 取消在这段时间内发生
+		return SourceRecord{}, false
+	}
+	if int(s.pos) >= len(s.recs) {
+		return SourceRecord{}, false
+	}
+	r := s.recs[s.pos]
+	s.pos++
+	return r, true
+}
+
+func (s *blockingAfterFirstSource) SeekTo(offset int64) error { s.pos = offset; return nil }
+
+// waitFor 轮询条件成立，超时即失败。
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("等待条件超时")
+}
+
+func testRegistryV3(t *testing.T) *schema.Registry {
+	t.Helper()
+	r := testRegistry(t)
+	if err := r.Register(MarketEventSchemaV3()); err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
